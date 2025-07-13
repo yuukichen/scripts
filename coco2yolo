@@ -1,0 +1,245 @@
+import json
+import os
+import shutil
+from collections import defaultdict
+
+
+def create_data_yaml(output_dir):
+    """创建data.yaml配置文件"""
+    yaml_content = f"""# COCO-Pose dataset configuration
+path: {os.path.abspath(output_dir)}  # dataset root dir
+train: images/train  # train images (relative to 'path')
+val: images/val  # val images (relative to 'path')
+
+# Classes
+nc: 1  # number of classes
+names:
+  0: person
+
+# Keypoints
+kpt_shape: [17, 3]  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
+flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]  # flip indices for left-right keypoints
+"""
+
+    with open(os.path.join(output_dir, 'data.yaml'), 'w') as f:
+        f.write(yaml_content)
+
+    print(f"INFO: data.yaml配置文件已创建")
+
+
+def tlwh2xywhn(xywh, shape, precision=8):
+    """左上+宽高 => 归一化的中心+宽高"""
+    x, y, w, h = xywh[:4]
+    x_center = round((x + w / 2.0) / shape[1], precision)
+    y_center = round((y + h / 2.0) / shape[0], precision)
+    box_width = round(w / shape[1], precision)
+    box_height = round(h / shape[0], precision)
+    return [x_center, y_center, box_width, box_height]
+
+
+def coco2yolo_keypoints(coco_anno, shape, precision=8):
+    """将一条coco关键点标注转换yolo格式"""
+    keypoints = coco_anno['keypoints']
+    bbox = coco_anno['bbox']
+
+    # 检查bbox是否有效
+    if len(bbox) != 4 or bbox[2] <= 0 or bbox[3] <= 0:
+        return None
+
+    yolo_anno = [0]  # 人的类别ID为0
+    yolo_anno.extend(tlwh2xywhn(bbox, shape, precision=precision))
+
+    # 添加关键点坐标（17个关键点，每个3个值：x, y, visibility）
+    if len(keypoints) != 51:  # 17 * 3 = 51
+        print(f"WARNING: 关键点数量不正确，期望51个值，实际{len(keypoints)}个")
+        return None
+
+    for i in range(0, len(keypoints), 3):
+        x = keypoints[i]
+        y = keypoints[i + 1]
+        v = keypoints[i + 2]  # 可见性：0=不可见，1=被遮挡，2=可见
+
+        # 归一化坐标
+        if x > 0 and y > 0:  # 只有当坐标有效时才归一化
+            x_norm = round(x / shape[1], precision)
+            y_norm = round(y / shape[0], precision)
+        else:
+            x_norm = 0.0
+            y_norm = 0.0
+            v = 0  # 设置为不可见
+
+        yolo_anno.extend([x_norm, y_norm, v])
+
+    return yolo_anno
+
+
+def process_coco_dataset(coco_json_path, src_images_dir, output_dir, split_name):
+    """处理COCO数据集"""
+    print(f"INFO: 开始处理{split_name}数据集...")
+    print(f"INFO: JSON文件路径: {coco_json_path}")
+    print(f"INFO: 图片源目录: {src_images_dir}")
+
+    # 检查文件是否存在
+    if not os.path.exists(coco_json_path):
+        print(f"ERROR: JSON文件不存在: {coco_json_path}")
+        return 0
+
+    if not os.path.exists(src_images_dir):
+        print(f"ERROR: 图片目录不存在: {src_images_dir}")
+        return 0
+
+    # 读取COCO标注文件
+    with open(coco_json_path, 'r') as f:
+        coco_data = json.load(f)
+
+    images = coco_data['images']
+    annotations = coco_data['annotations']
+
+    print(f"INFO: 读取到{len(images)}张图片，{len(annotations)}个标注")
+
+    # 创建输出目录
+    images_dir = os.path.join(output_dir, 'images', split_name)
+    labels_dir = os.path.join(output_dir, 'labels', split_name)
+    os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(labels_dir, exist_ok=True)
+
+    # 构建图片信息字典
+    image_info = {}
+    for img in images:
+        image_info[img['id']] = {
+            'file_name': img['file_name'],
+            'width': img['width'],
+            'height': img['height'],
+            'annotations': []
+        }
+
+    # 添加标注信息
+    valid_annotations = 0
+    for anno in annotations:
+        # 检查是否有足够的关键点且不是crowd
+        if anno.get('num_keypoints', 0) > 0 and not anno.get('iscrowd', False):
+            image_id = anno['image_id']
+            if image_id in image_info:
+                image_info[image_id]['annotations'].append(anno)
+                valid_annotations += 1
+
+    print(f"INFO: 有效标注数量: {valid_annotations}")
+
+    # 处理每张图片
+    processed_images = 0
+    processed_annotations = 0
+
+    for img_id, info in image_info.items():
+        if not info['annotations']:
+            continue
+
+        file_name = info['file_name']
+        width = info['width']
+        height = info['height']
+
+        # 复制图片文件
+        src_img_path = os.path.join(src_images_dir, file_name)
+        dst_img_path = os.path.join(images_dir, file_name)
+
+        if os.path.exists(src_img_path):
+            shutil.copy2(src_img_path, dst_img_path)
+
+            # 创建标签文件
+            label_file = os.path.join(labels_dir, f"{os.path.splitext(file_name)[0]}.txt")
+
+            with open(label_file, 'w') as f:
+                for anno in info['annotations']:
+                    yolo_anno = coco2yolo_keypoints(anno, (height, width))
+                    if yolo_anno is not None:
+                        line = ' '.join(map(str, yolo_anno))
+                        f.write(line + '\n')
+                        processed_annotations += 1
+
+            processed_images += 1
+
+            if processed_images % 1000 == 0:
+                print(f"INFO: 已处理{processed_images}张图片...")
+
+        else:
+            print(f"WARNING: 图片文件不存在: {src_img_path}")
+
+    print(f"INFO: {split_name}数据集处理完成")
+    print(f"INFO: 处理图片数量: {processed_images}")
+    print(f"INFO: 处理标注数量: {processed_annotations}")
+    return processed_images
+
+
+def main():
+    """主函数"""
+    print("=" * 60)
+    print("COCO数据集转换为YOLO Pose格式")
+    print("=" * 60)
+
+    # 输出目录
+    output_dir = './coco_pose'
+
+    # 创建主输出目录
+    if os.path.exists(output_dir):
+        print(f"INFO: 输出目录已存在，将清空并重新创建: {output_dir}")
+        shutil.rmtree(output_dir)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 处理训练集
+    train_json = './coco2017/annotations/person_keypoints_train2017.json'
+    train_images_dir = './coco2017/train2017'
+    train_count = process_coco_dataset(train_json, train_images_dir, output_dir, 'train')
+
+    print("\n" + "=" * 60)
+
+    # 处理验证集
+    val_json = './coco2017/annotations/person_keypoints_val2017.json'
+    val_images_dir = './coco2017/val2017'
+    val_count = process_coco_dataset(val_json, val_images_dir, output_dir, 'val')
+
+    # 创建data.yaml配置文件
+    create_data_yaml(output_dir)
+
+    print("\n" + "=" * 60)
+    print("数据集转换完成！")
+    print("=" * 60)
+    print(f"输出目录: {os.path.abspath(output_dir)}")
+    print(f"训练集图片: {train_count}")
+    print(f"验证集图片: {val_count}")
+    print("=" * 60)
+    print("目录结构:")
+    print(f"{output_dir}/")
+    print("├── images/")
+    print("│   ├── train/        # 训练集图片")
+    print("│   └── val/          # 验证集图片")
+    print("├── labels/")
+    print("│   ├── train/        # 训练集标签")
+    print("│   └── val/          # 验证集标签")
+    print("└── data.yaml         # 数据集配置文件")
+    print("=" * 60)
+    print("使用方法:")
+    print(f"yolo train data={os.path.abspath(output_dir)}/data.yaml model=yolov8n-pose.pt epochs=100")
+    print("=" * 60)
+
+    # 验证生成的数据集
+    print("数据集验证:")
+    train_images = len(os.listdir(os.path.join(output_dir, 'images', 'train'))) if os.path.exists(
+        os.path.join(output_dir, 'images', 'train')) else 0
+    train_labels = len(os.listdir(os.path.join(output_dir, 'labels', 'train'))) if os.path.exists(
+        os.path.join(output_dir, 'labels', 'train')) else 0
+    val_images = len(os.listdir(os.path.join(output_dir, 'images', 'val'))) if os.path.exists(
+        os.path.join(output_dir, 'images', 'val')) else 0
+    val_labels = len(os.listdir(os.path.join(output_dir, 'labels', 'val'))) if os.path.exists(
+        os.path.join(output_dir, 'labels', 'val')) else 0
+
+    print(f"训练集: {train_images} 图片, {train_labels} 标签")
+    print(f"验证集: {val_images} 图片, {val_labels} 标签")
+
+    if train_images == train_labels and val_images == val_labels:
+        print("✓ 数据集验证通过！图片和标签数量匹配")
+    else:
+        print("✗ 警告：图片和标签数量不匹配，请检查转换过程")
+
+
+if __name__ == '__main__':
+    main()
